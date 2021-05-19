@@ -1,5 +1,5 @@
 
-use bytes::{Bytes, BytesMut};
+use bytes::{BytesMut};
 use std::error::Error;
 use std::io::{ErrorKind};
 use std::str::from_utf8;
@@ -9,12 +9,11 @@ use tokio::net::{TcpListener};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast;
 
-/*
+#[derive (Clone, Debug)]
 struct Message {
     username: String,
-    message: Bytes,
+    message: String,
 }
-*/
 
 pub struct BufferedReader<T> {
     stream: T,
@@ -59,12 +58,12 @@ impl<T: AsyncReadExt + Unpin> BufferedReader<T> {
 async fn main() -> Result<(), Box<dyn Error>> {
     // Bind the listener to the address
     let listener = TcpListener::bind("127.0.0.1:5000").await.unwrap();
-    let (tx, _) = broadcast::channel::<Bytes>(16);
+    let (tx, _) = broadcast::channel(16);
     let tx = Arc::new(Mutex::new(tx));
     loop {
         // The second item contains the IP and port of the new connection.
         let (socket, _) = listener.accept().await.unwrap();
-        let (read_socket, write_socket) = io::split(socket);
+        let (read_socket, mut write_socket) = io::split(socket);
 
         let tx = tx.clone();
         let rx = {
@@ -73,20 +72,40 @@ async fn main() -> Result<(), Box<dyn Error>> {
         };
 
         tokio::spawn(async move {
-            reader(read_socket, tx).await.unwrap();
+            write_socket.write_all(b"username: ").await.unwrap();
+
+            let mut buff_reader = BufferedReader::new(read_socket);
+
+            let username = match buff_reader.read_line().await.unwrap() {
+                None => { return; }
+                Some(username) => String::from(username.trim())
+            };
+            let username_clone = username.clone();
+
+            tokio::spawn(async move {
+                writer_loop(write_socket, String::from(username), rx).await.unwrap();
+            });
+
+            reader_loop(buff_reader, String::from(username_clone), tx).await.unwrap();
         });
 
-        tokio::spawn(async move {
-            writer(write_socket, rx).await.unwrap();
-        });
     }
 }
 
-async fn writer<T: AsyncWriteExt + Unpin>(mut write_socket: T, mut rx: broadcast::Receiver<Bytes>) -> Result<(), Box<dyn Error>> {
+async fn writer_loop<T: AsyncWriteExt + Unpin>(mut write_socket: T,
+                                               username: String,
+                                               mut rx: broadcast::Receiver<Message>) -> Result<(), Box<dyn Error>> {
     loop {
-        let buf : Bytes = rx.recv().await?;
+        let msg : Message = rx.recv().await?;
+
+        if msg.username == username {
+            continue;
+        }
+
+        let to_send = format!("[{}] {}", msg.username, msg.message);
+
         let mut mut_buf : BytesMut = BytesMut::new();
-        mut_buf.extend_from_slice(&*buf);
+        mut_buf.extend_from_slice(to_send.as_bytes());
         match write_socket.write_all_buf(&mut mut_buf).await {
             Ok(()) => (),
             Err(err) => {
@@ -101,10 +120,11 @@ async fn writer<T: AsyncWriteExt + Unpin>(mut write_socket: T, mut rx: broadcast
     }
 }
 
-async fn reader<T: AsyncReadExt + Unpin>(read_socket: T, tx: Arc<Mutex<broadcast::Sender<Bytes>>>) -> Result<(), Box<dyn Error>> {
-    let mut conn = BufferedReader::new(read_socket);
+async fn reader_loop<T: AsyncReadExt + Unpin>(mut conn: BufferedReader<T>,
+                                              username: String,
+                                              tx: Arc<Mutex<broadcast::Sender<Message>>>) -> Result<(), Box<dyn Error>> {
     loop {
-        match  conn.read_line().await? {
+        match conn.read_line().await? {
             None => {
                 println!("Done with this socket");
                 return Ok(());
@@ -112,7 +132,7 @@ async fn reader<T: AsyncReadExt + Unpin>(read_socket: T, tx: Arc<Mutex<broadcast
             Some(line) => {
                 println!("GOT: {:?}", line);
                 let tx = tx.lock().unwrap();
-                tx.send(line.into())?;
+                tx.send(Message { username: username.clone(), message: line })?;
             },
         }
     }
