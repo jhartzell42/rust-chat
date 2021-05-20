@@ -5,7 +5,7 @@ use std::io::{ErrorKind};
 use std::str::from_utf8;
 use std::sync::{Arc, Mutex};
 
-use tokio::net::{TcpListener};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast;
 
@@ -57,13 +57,12 @@ impl<T: AsyncReadExt + Unpin> BufferedReader<T> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     // Bind the listener to the address
-    let listener = TcpListener::bind("127.0.0.1:5000").await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:5000").await?;
     let (tx, _) = broadcast::channel(16);
     let tx = Arc::new(Mutex::new(tx));
     loop {
         // The second item contains the IP and port of the new connection.
-        let (socket, _) = listener.accept().await.unwrap();
-        let (read_socket, mut write_socket) = io::split(socket);
+        let (socket, _) = listener.accept().await?;
 
         let tx = tx.clone();
         let rx = {
@@ -72,24 +71,37 @@ async fn main() -> Result<(), Box<dyn Error>> {
         };
 
         tokio::spawn(async move {
-            write_socket.write_all(b"username: ").await.unwrap();
-
-            let mut buff_reader = BufferedReader::new(read_socket);
-
-            let username = match buff_reader.read_line().await.unwrap() {
-                None => { return; }
-                Some(username) => String::from(username.trim())
-            };
-            let username_clone = username.clone();
-
-            tokio::spawn(async move {
-                writer_loop(write_socket, String::from(username), rx).await.unwrap();
+            handle_connection(tx, rx, socket).await.unwrap_or_else(|err| {
+                eprintln!("Error: {}", err);
+                ()
             });
-
-            reader_loop(buff_reader, String::from(username_clone), tx).await.unwrap();
         });
 
     }
+}
+
+async fn handle_connection(tx: Arc<Mutex<broadcast::Sender<Message>>>,
+                           rx: broadcast::Receiver<Message>,
+                           tcp_stream: TcpStream) -> Result<(), Box<dyn Error>> {
+    let (read_socket, mut write_socket) = io::split(tcp_stream);
+    write_socket.write_all(b"username: ").await?;
+
+    let mut buff_reader = BufferedReader::new(read_socket);
+
+    let username = match buff_reader.read_line().await? {
+        None => { return Ok(()); }
+        Some(username) => String::from(username.trim())
+    };
+    let username_clone = username.clone();
+
+    tokio::spawn(async move {
+        writer_loop(write_socket, String::from(username), rx).await.unwrap_or_else(|err| {
+            eprintln!("Error: {}", err);
+            ()
+        });
+    });
+
+    reader_loop(buff_reader, String::from(username_clone), tx).await
 }
 
 async fn writer_loop<T: AsyncWriteExt + Unpin>(mut write_socket: T,
@@ -110,9 +122,9 @@ async fn writer_loop<T: AsyncWriteExt + Unpin>(mut write_socket: T,
             Ok(()) => (),
             Err(err) => {
                 match err.kind() {
-                    ErrorKind::BrokenPipe => (),
-                    ErrorKind::ConnectionReset => (),
-                    ErrorKind::NotConnected => (),
+                    ErrorKind::BrokenPipe => return Ok(()),
+                    ErrorKind::ConnectionReset => return Ok(()),
+                    ErrorKind::NotConnected => return Ok(()),
                     _ => { return Err(err.into()) }
                 }
             }
