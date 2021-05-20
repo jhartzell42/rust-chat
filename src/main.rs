@@ -1,4 +1,6 @@
 
+mod frame_reader;
+
 use bytes::{BytesMut};
 use color_eyre::eyre::{Report, WrapErr, eyre};
 
