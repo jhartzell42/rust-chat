@@ -1,10 +1,11 @@
 
 mod frame_reader;
+use crate::frame_reader::{Delimitation, FrameReader, ReadFrameError, Frameable};
 
-use bytes::{BytesMut};
+use bytes::{Bytes, BytesMut};
 use color_eyre::eyre::{Report, WrapErr, eyre};
 
-use std::io::{Error, ErrorKind};
+use std::io::{ErrorKind};
 use std::str::{Utf8Error, from_utf8};
 use std::sync::{Arc, Mutex};
 
@@ -18,52 +19,22 @@ struct Message {
     message: String,
 }
 
-pub struct LineReader<T> {
-    stream: T,
-    buffer: BytesMut,
-    eof: bool,
-}
+#[derive (Clone, Debug)]
+pub struct Line(String);
 
-#[derive (thiserror::Error, Debug)]
-pub enum ReadLineError {
-    #[error("Invalid UTF8")]
-    ConversionError(#[from] Utf8Error),
-    #[error("IO error")]
-    IOError(#[from] Error),
-    #[error("EOF")]
-    EOF,
-}
-
-impl<T: AsyncReadExt + Unpin> LineReader<T> {
-    pub fn new(stream: T) -> Self {
-        LineReader {
-            stream: stream,
-            buffer: BytesMut::new(),
-            eof: false,
+impl Frameable for Line {
+    type ParseError = Utf8Error;
+    fn delimit(buf: &BytesMut) -> Delimitation {
+        for (i, ch) in buf.iter().enumerate() {
+            if *ch == b'\n' {
+                return Delimitation::Index(i + 1);
+            }
         }
+        Delimitation::NotPresent
     }
 
-    pub async fn read_line(&mut self) -> Result<String, ReadLineError> {
-        loop {
-            for (i, ch) in self.buffer.iter().enumerate() {
-                if *ch == b'\n' {
-                    return Ok(String::from(from_utf8(&*self.buffer.split_to(i + 1))?))
-                }
-            }
-
-            if self.eof {
-                return if self.buffer.len() == 0 {
-                    Err(ReadLineError::EOF)
-                } else {
-                    return Ok(String::from(from_utf8(&*self.buffer.split())?))
-                }
-            }
-
-            if let 0 = self.stream.read_buf(&mut self.buffer).await? {
-                self.eof = true;
-            }
-            println!("Completed read. Buffer contents: {:?}", self.buffer);
-        }
+    fn parse(buf: Bytes) -> Result<Self, Self::ParseError> {
+        Ok(Line(String::from(from_utf8(&*buf)?)))
     }
 }
 
@@ -101,9 +72,9 @@ async fn handle_connection(tx: Arc<Mutex<broadcast::Sender<Message>>>,
     let (read_socket, mut write_socket) = io::split(tcp_stream);
     write_socket.write_all(b"username: ").await?;
 
-    let mut buff_reader = LineReader::new(read_socket);
+    let mut buff_reader = FrameReader::new(read_socket);
 
-    let username = buff_reader.read_line().await.wrap_err("Retrieving username")?;
+    let Line(username) = buff_reader.read_frame().await.wrap_err("Retrieving username")?;
     let username = String::from(username.trim());
     if username.len() == 0 {
         return Err(eyre!("Need to specify a username"));
@@ -149,19 +120,19 @@ async fn writer_loop<T: AsyncWriteExt + Unpin>(mut write_socket: T,
     }
 }
 
-async fn reader_loop<T: AsyncReadExt + Unpin>(mut conn: LineReader<T>,
+async fn reader_loop<T: AsyncReadExt + Unpin>(mut conn: FrameReader<Line, T>,
                                               username: String,
                                               tx: Arc<Mutex<broadcast::Sender<Message>>>) -> Result<(), Report> {
     loop {
-        match conn.read_line().await {
-            Err(ReadLineError::EOF) => {
+        match conn.read_frame().await {
+            Err(ReadFrameError::EOF) => {
                 println!("Done with this socket");
                 return Ok(());
             },
             Err(other) => {
                 Err(other).wrap_err("Reading message")?
             }
-            Ok(line) => {
+            Ok(Line(line)) => {
                 println!("GOT: {:?}", line);
                 let tx = tx.lock().map_err(|_| eyre!("Poison lock"))?;
                 tx.send(Message { username: username.clone(), message: line })
